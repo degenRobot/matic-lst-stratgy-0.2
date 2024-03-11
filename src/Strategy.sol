@@ -6,6 +6,30 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 // Import interfaces for many popular DeFi projects, or add your own!
 //import "../interfaces/<protocol>/<Interface>.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+// Import interfaces for many popular DeFi projects, or add your own!
+//import "../interfaces/<protocol>/<Interface>.sol";
+
+// AAVE Interfaces
+import {IAToken} from "./interfaces/aave/IAToken.sol";
+import {IVariableDebtToken} from "./interfaces/aave/IVariableDebtToken.sol";
+import {IPool} from "./interfaces/aave/IPool.sol";
+import {IAaveOracle} from "./interfaces/aave/IAaveOracle.sol";
+import {IPoolAddressesProvider} from "./interfaces/aave/IPoolAddressesProvider.sol";
+import {IRouter} from "./interfaces/quickswap/IRouter.sol";
+import {ExactInputSingleParams} from "./interfaces/quickswap/IRouter.sol";
+
+// Balancer Interfaces & Structs
+import {IBalancerV2} from "./interfaces/balancer/IBalancerV2.sol";
+import {SingleSwap} from "./interfaces/balancer/IBalancerV2.sol";
+import {FundManagement} from "./interfaces/balancer/IBalancerV2.sol";
+import {JoinPoolRequest} from "./interfaces/balancer/IBalancerV2.sol";
+import {ExitPoolRequest} from "./interfaces/balancer/IBalancerV2.sol";
+import {BatchSwapStep} from "./interfaces/balancer/IBalancerV2.sol";
+
+import {IAura} from "./interfaces/aura/IAura.sol";
+import {IBaseRewardPool} from "./interfaces/aura/IAura.sol";
 
 /**
  * The `TokenizedStrategy` variable can be used to retrieve the strategies
@@ -25,8 +49,137 @@ contract Strategy is BaseStrategy {
 
     constructor(
         address _asset,
+        address _assetOut, // what we swap for via bal when converting to asset
+        address _aToken,
+        bool _swapViaQuick,
         string memory _name
-    ) BaseStrategy(_asset, _name) {}
+    ) BaseStrategy(_asset, _name) {
+
+        aToken = IAToken(_aToken);
+        swapViaQuick = _swapViaQuick;
+        assetOut = ERC20(_assetOut);
+        _setInterfaces();
+        _approveContracts();
+
+
+    }
+
+
+    function _setInterfaces() internal {
+        // Tokens
+        wMatic = ERC20(0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270);
+        stMatic = ERC20(0x3A58a54C066FdC0f2D55FC9C89F0415C92eBf3C4);
+        farmToken = IERC20(0x9a71012B13CA4d3D0Cdc72A177DF3ef03b0E76A3);
+        auraToken = IERC20(0x1509706a6c66CA549ff0cB464de88231DDBe213B);
+
+        // AAVE Contracts
+        IPoolAddressesProvider provider = IPoolAddressesProvider(0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb);
+        pool = IPool(0x794a61358D6845594F94dc1DB02A252b5b4814aD);
+        oracle = IAaveOracle(provider.getPriceOracle());
+
+
+        debtToken = IVariableDebtToken(0x4a1c3aD6Ed28a636ee1751C69071f6be75DEb8B8);  
+
+        // Balancer Contracts
+        lpToken = 0xf0ad209e2e969EAAA8C882aac71f02D8a047d5c2;
+        balancer = IBalancerV2(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
+
+        // Farm Contracts
+        aura = IAura(0x98Ef32edd24e2c92525E59afc4475C1242a30184);
+        baseRewardPool = IBaseRewardPool(0xB97341e9DA2eA5654a0E198184F88eef630E9a63);
+
+        // Quickswap Router (used to swap USDC.e to USDC)
+        router = IRouter(0xf5b509bB0909a69B1c207E495f687a596C168E12);
+
+
+    }
+
+    function _approveContracts() internal {
+        asset.approve(address(pool), type(uint256).max);   
+        wMatic.approve(address(pool), type(uint256).max);
+
+        assetOut.approve(address(router), type(uint256).max);
+        
+        wMatic.approve(address(balancer), type(uint256).max);
+        stMatic.approve(address(balancer), type(uint256).max);
+        farmToken.approve(address(balancer), type(uint256).max);
+        
+        // to deposit into Aura 
+        address boosterLite = 0x98Ef32edd24e2c92525E59afc4475C1242a30184;
+        ERC20(lpToken).approve(boosterLite, type(uint256).max);
+        ERC20(lpToken).approve(address(balancer), type(uint256).max);
+
+    }
+
+    ERC20 public wMatic;
+    ERC20 public stMatic;
+    ERC20 public assetOut;
+    IERC20 public farmToken;
+    IERC20 public auraToken;
+
+    // If need to swap via quick i.e. if we need to swap USDC.e to USDC
+    bool public swapViaQuick;
+
+    uint256 public collatUpper = 6700;
+    uint256 public collatTarget = 6000;
+    uint256 public collatLower = 5300;
+    uint256 public collatLimit = 7500;
+
+    // this is used to adj amount of wMatic swapped to better align weights to pool weights 
+    uint256 public swapPercentAdj = 10150; // 101.5%
+    uint256 public slippageAdjSwap = 9950; // 99.5%    
+    uint256 public slippageAdjPool = 9950; // 99.5%
+    uint256 public basisPrecision = 10000;
+
+    // max Amount of wMatic to be deployed any give time assets deployed (to avoid slippage)
+    uint256 public maxDeploy = type(uint256).max; 
+
+    IPool public pool;
+    IAToken public aToken;
+    IVariableDebtToken public debtToken;
+
+    IAaveOracle public oracle;
+
+    IBalancerV2 public balancer;
+    address public lpToken;
+    IAura public aura;
+    IBaseRewardPool public baseRewardPool;
+
+    uint256 public pid = 5;
+
+    bytes32 public poolId = 0xf0ad209e2e969eaaa8c882aac71f02d8a047d5c2000200000000000000000b49;
+    //bytes32 public farmPoolId = 0xf0ad209e2e969eaaa8c882aac71f02d8a047d5c2000200000000000000000b49;
+
+    IRouter public router;
+
+    function setCollatTargets(uint256 _collatLow, uint256 _collatTarget, uint256 _collatHigh) external onlyManagement {
+        require(_collatLow < _collatTarget);
+        require(_collatTarget < _collatHigh);
+        require(_collatHigh < collatLimit);
+
+        collatLower = _collatLow;
+        collatTarget = _collatTarget;
+        collatUpper = _collatHigh;
+
+    }
+
+    function setSlippageConfig(uint256 _slippageSwap, uint256 _slippagePool) external onlyManagement {
+        require(_slippageSwap < basisPrecision);
+        require(_slippagePool < basisPrecision);
+
+        slippageAdjSwap = _slippageSwap;
+        slippageAdjPool = _slippagePool;
+
+    }
+
+    function setMaxDeploy(uint256 _maxDeploy) external onlyManagement {
+        maxDeploy = _maxDeploy;
+    }
+
+    // Placeholder to potentially withdraw AURA to multi-sig & bridge then swap (as no LP on Polygon to swap)
+    function withdrawAura(address _recipient) external onlyManagement {
+        auraToken.transfer(_recipient, auraToken.balanceOf(address(this)));
+    }
 
     /*//////////////////////////////////////////////////////////////
                 NEEDED TO BE OVERRIDDEN BY STRATEGIST
@@ -44,10 +197,372 @@ contract Strategy is BaseStrategy {
      * to deposit in the yield source.
      */
     function _deployFunds(uint256 _amount) internal override {
-        // TODO: implement deposit logic EX:
-        //
-        //      lendingPool.deposit(address(asset), _amount ,0);
+        // Provide collateral to aave 
+        _lendWant(_amount);
+
+        // Calculate how much wMatic to borrow 
+        uint256 oPrice = getOraclePrice();
+        uint256 _borrowAmt = (_amount * collatTarget / basisPrecision) * 1e18 / oPrice;
+
+        (uint256 _wMaticWeight, uint256 _lpValue) = getLpData();
+
+        if (_borrowAmt > maxDeploy) {
+            _borrowAmt = maxDeploy;
+        }  
+        _borrow(_borrowAmt);
+
+        // Swap wMatic for stMatic and enter pool 
+        uint256 _swapAmt = (_borrowAmt * (basisPrecision - _wMaticWeight) / swapPercentAdj) * 1e18 / (1e18 * ( 1 + _borrowAmt / _lpValue) );
+        _swapToStMatic(_swapAmt);
+        _joinPool();
+        _depositToGauge();
     }
+
+
+    function balanceLend() public view returns (uint256) {
+        return aToken.balanceOf(address(this));
+    }
+
+    function balanceDebtInShort() public view returns (uint256) {
+        // Each debtToken is pegged 1:1 with the short token
+        return debtToken.balanceOf(address(this));
+    }
+
+    function balanceDebt() public view returns (uint256) {
+        uint256 oPrice = getOraclePrice();
+        return (balanceDebtInShort() * oPrice / 1e18);
+    }
+
+    // balance of any wMatic / stMatic not deployed 
+    function balanceShort() public view returns(uint256) {
+        uint256 oPrice = getOraclePrice();
+        uint256 oPriceLst = getOraclePriceLst();
+        
+        uint256 bal = wMatic.balanceOf(address(this));
+        bal += stMatic.balanceOf(address(this)) * oPriceLst / basisPrecision;
+
+        return bal * oPrice / 1e18;
+
+    }
+
+    // Calculate value of LP in asset
+    function balanceLp() public view returns (uint256) {
+
+        (address[] memory tokens, uint256[] memory balances,) = balancer.getPoolTokens(poolId);
+
+        uint256 _oPrice = getOraclePrice();
+        uint256 _oPriceLst = getOraclePriceLst();
+        uint256 gaugeTokens = baseRewardPool.balanceOf(address(this));
+        uint256 gaugeSupply = IERC20(lpToken).totalSupply();
+
+
+        // we get the total value in the LP pool priced in wMatic 
+        uint256 _totalValue;
+
+        if (tokens[0] == address(wMatic)) {
+            _totalValue += balances[0];
+            _totalValue += balances[1] * _oPriceLst / basisPrecision;
+        } else {
+            _totalValue += balances[1];
+            _totalValue += balances[0] * _oPriceLst / basisPrecision;
+        }
+
+        // calculate strategies value of LP tokens in asset price
+        return ((gaugeTokens * _totalValue / gaugeSupply) * _oPrice / 1e18);
+
+
+    }
+
+    function balanceDeployed() public view returns (uint256) {
+        return balanceLend() - balanceDebt() + balanceLp() + balanceShort();
+    }
+
+    function calcCollateralRatio() public view returns (uint256) {
+        return (balanceDebt() * basisPrecision / balanceLend());
+    }
+
+    function _lendWant(uint256 amount) internal {
+        pool.supply(address(asset), amount, address(this), 0);
+    }
+
+    function _redeemWant(uint256 _redeemAmount) internal {
+
+        // We run this check in case some dust is left & cannot redeem full amount 
+        uint256 _bal = balanceLend();
+        uint256 _debt = balanceDebt();
+
+        uint256 _maxRedeem = _bal - (_debt * basisPrecision / collatLimit);
+
+        if (_redeemAmount > _maxRedeem) {
+            _redeemAmount = _maxRedeem;
+        }
+
+        if (_redeemAmount == 0) return;
+        pool.withdraw(address(asset), _redeemAmount, address(this));
+    }
+
+    function _borrow(uint256 borrowAmount) internal {
+        pool.borrow(address(wMatic), borrowAmount, 2, 0, address(this));
+    }
+
+    function _repayDebt() internal {
+        uint256 _bal = wMatic.balanceOf(address(this));
+        if (_bal == 0) return;
+
+        uint256 _debt = balanceDebtInShort();
+        if (_bal < _debt) {
+            pool.repay(address(wMatic), _bal, 2, address(this));
+        } else {
+            pool.repay(address(wMatic), _debt, 2, address(this));
+        }
+    }
+
+
+    // used to determine how much wMatic to borrow
+    function getOraclePrice() public view returns (uint256) {
+        uint256 shortOPrice = oracle.getAssetPrice(address(wMatic));
+        uint256 wantOPrice = oracle.getAssetPrice(address(asset));
+        return
+            shortOPrice*(10**(asset.decimals() + (18) - (wMatic.decimals())))/(
+                wantOPrice
+            );
+    }
+
+    // used to compare price of LST to wMatic to determine min Out on Swap 
+    function getOraclePriceLst() public view returns (uint256) {
+        uint256 wMaticPrice = oracle.getAssetPrice(address(wMatic));
+        uint256 stMaticPrice = oracle.getAssetPrice(address(stMatic));
+        return stMaticPrice*(basisPrecision)/wMaticPrice;
+    }
+
+    // Fetches relevant data from balancer pool (weight of wMatic, total value of LP tokens in pool)  
+    function getLpData() public view returns (uint256 _wMaticWeight, uint256 _totalValue) {
+        (address[] memory tokens, uint256[] memory balances,) = balancer.getPoolTokens(poolId);
+
+        uint256 _oPrice = getOraclePriceLst();
+        if (tokens[0] == address(wMatic)) {
+            _totalValue += balances[0];
+            _totalValue += balances[1] * _oPrice / basisPrecision;
+            _wMaticWeight = balances[0] * basisPrecision / _totalValue;
+        } else {
+            _totalValue += balances[1];
+            _totalValue += balances[0] * _oPrice / basisPrecision;
+            _wMaticWeight = balances[1] * basisPrecision / _totalValue;
+        }
+        
+
+    }
+
+    // Deposit wMatic & stMatic into balancer pool
+    function _joinPool() internal {
+
+        address[] memory assets = new address[](2);
+        uint256[] memory amtsIn = new uint256[](2);
+
+        // Initialize the arrays
+        assets[0] = address(wMatic);
+        assets[1] = address(stMatic);
+        amtsIn[0] = wMatic.balanceOf(address(this));
+        amtsIn[1] = stMatic.balanceOf(address(this));
+
+        uint256 bptOut;
+        uint256 gaugeSupply = IERC20(lpToken).totalSupply();
+        (address[] memory tokens, uint256[] memory balances,) = balancer.getPoolTokens(poolId);
+
+        if (tokens[0] == address(stMatic)) {
+            bptOut = (amtsIn[1] * gaugeSupply / balances[0]) * slippageAdjPool / basisPrecision;
+        } else {
+            bptOut = (amtsIn[1] * gaugeSupply / balances[1]) * slippageAdjPool / basisPrecision;
+        }
+
+        bytes memory userData = abi.encode(IBalancerV2.JoinKind.ALL_TOKENS_IN_FOR_EXACT_BPT_OUT, bptOut);
+
+
+        // Create the JoinPoolRequest struct in memory
+        JoinPoolRequest memory request = JoinPoolRequest({
+            assets: assets,
+            maxAmountsIn: amtsIn,
+            userData: userData,
+            fromInternalBalance: false
+        });
+        balancer.joinPool(poolId, address(this), address(this), request);
+    }
+
+    // Deposit Lp tokens into Aura Gauge
+    function _depositToGauge() internal {
+        aura.deposit(pid, IERC20(lpToken).balanceOf(address(this)),true);
+    }
+
+    // Withdraw Lp tokens from Aura Gauge
+    function _withdrawFromGauge(uint256 _amount) internal {
+        baseRewardPool.withdrawAndUnwrap(_amount, false);
+    }
+
+    // Unwinds LP position and exits pool
+    function _exitPool(uint256 _amountOut) internal {
+
+        uint256[] memory amtsOut = new uint256[](2);
+
+        (address[] memory assets, uint256[] memory balances,) = balancer.getPoolTokens(poolId);
+
+        amtsOut[0] = (balances[0] * _amountOut / IERC20(lpToken).totalSupply()) * slippageAdjPool / basisPrecision;
+        amtsOut[1] = (balances[1] * _amountOut / IERC20(lpToken).totalSupply()) * slippageAdjPool / basisPrecision;
+
+        bytes memory userData = abi.encode(1, _amountOut);
+
+        // Create the ExitPoolRequest struct in memory
+        ExitPoolRequest memory request = ExitPoolRequest({
+            assets: assets,
+            minAmountsOut: amtsOut,
+            userData: userData,
+            toInternalBalance: false
+        });
+        balancer.exitPool(poolId, address(this), payable(address(this)), request);
+    }
+
+    // Used to swap wMatic to stMatic via balancer 
+    function _swapToStMatic(uint256 _amountIn) internal {
+
+        uint256 oPrice = getOraclePriceLst();
+        uint256 _minOut = (_amountIn * basisPrecision / oPrice) * slippageAdjSwap / basisPrecision;
+
+        SingleSwap memory singleSwap = SingleSwap({
+            poolId: poolId,
+            kind: 0,
+            assetIn: address(wMatic),
+            assetOut: address(stMatic),
+            amount: _amountIn,
+            userData: abi.encode(0)
+        });
+
+        FundManagement memory funds = FundManagement({
+            sender: address(this),
+            fromInternalBalance: false,
+            recipient: payable(address(this)),
+            toInternalBalance: false
+        });
+
+        balancer.swap(singleSwap, funds, _minOut, block.timestamp);
+    }
+
+    function _swapToWMatic(uint256 _amountIn) internal {
+        uint256 oPrice = getOraclePriceLst();
+        uint256 _minOut = (_amountIn * basisPrecision / oPrice) * slippageAdjSwap / basisPrecision;
+
+        SingleSwap memory singleSwap = SingleSwap({
+            poolId: poolId,
+            kind: 0,
+            assetIn: address(stMatic),
+            assetOut: address(wMatic),
+            amount: _amountIn,
+            userData: abi.encode(0)
+        });
+
+        FundManagement memory funds = FundManagement({
+            sender: address(this),
+            fromInternalBalance: false,
+            recipient: payable(address(this)),
+            toInternalBalance: false
+        });
+
+        balancer.swap(singleSwap, funds, _minOut, block.timestamp);
+
+    }
+
+    function _swapMaticToUSDC() internal {
+        uint256 _amountIn = wMatic.balanceOf(address(this));
+
+        SingleSwap memory singleSwap = SingleSwap({
+            poolId: 0x0297e37f1873d2dab4487aa67cd56b58e2f27875000100000000000000000002,
+            kind: 0,
+            assetIn: address(wMatic),
+            assetOut: address(assetOut),
+            amount: _amountIn,
+            userData: abi.encode(0)
+        });
+
+        FundManagement memory funds = FundManagement({
+            sender: address(this),
+            fromInternalBalance: false,
+            recipient: payable(address(this)),
+            toInternalBalance: false
+        });
+
+        balancer.swap(singleSwap, funds, 0, block.timestamp);
+
+        if (swapViaQuick) {
+            _swapUSDCetoUSDC();
+        }
+        
+    }
+
+    function _swapRewardsToAsset() internal {
+        uint256 _amountIn = farmToken.balanceOf(address(this));
+
+        SingleSwap memory singleSwap = SingleSwap({
+            poolId: 0x0297e37f1873d2dab4487aa67cd56b58e2f27875000100000000000000000002,
+            kind: 0,
+            assetIn: address(farmToken),
+            assetOut: address(assetOut),
+            amount: _amountIn,
+            userData: abi.encode(0)
+        });
+
+        FundManagement memory funds = FundManagement({
+            sender: address(this),
+            fromInternalBalance: false,
+            recipient: payable(address(this)),
+            toInternalBalance: false
+        });
+
+        balancer.swap(singleSwap, funds, 0, block.timestamp);
+
+        if (swapViaQuick) {
+            _swapUSDCetoUSDC();
+        }
+    }
+
+    function _swapUSDCetoUSDC() internal {
+
+        uint256 _amount = assetOut.balanceOf(address(this));
+        // asssuming 1 for 1 USDCe to USDC 
+        uint256 amountOut = _amount;
+
+        ExactInputSingleParams memory input;
+        input.amountIn = _amount;
+        input.tokenIn = address(assetOut);
+        input.tokenOut = address(asset);
+        input.recipient = address(this);
+        input.deadline = block.timestamp;
+        input.amountOutMinimum = amountOut*(slippageAdjSwap)/(basisPrecision);
+        router.exactInputSingle(input);
+
+    }
+
+    function _swapRewardsToWMatic() internal {
+        uint256 _amountIn = farmToken.balanceOf(address(this));
+
+        SingleSwap memory singleSwap = SingleSwap({
+            poolId: 0x0297e37f1873d2dab4487aa67cd56b58e2f27875000100000000000000000002,
+            kind: 0,
+            assetIn: address(farmToken),
+            assetOut: address(wMatic),
+            amount: _amountIn,
+            userData: abi.encode(0)
+        });
+
+        FundManagement memory funds = FundManagement({
+            sender: address(this),
+            fromInternalBalance: false,
+            recipient: payable(address(this)),
+            toInternalBalance: false
+        });
+
+        balancer.swap(singleSwap, funds, 0, block.timestamp);
+
+    }
+
+
 
     /**
      * @dev Should attempt to free the '_amount' of 'asset'.
@@ -71,10 +586,70 @@ contract Strategy is BaseStrategy {
      * @param _amount, The amount of 'asset' to be freed.
      */
     function _freeFunds(uint256 _amount) internal override {
-        // TODO: implement withdraw logic EX:
-        //
-        //      lendingPool.withdraw(address(asset), _amount);
+
+        uint256 _percentWithdrawn = _amount * basisPrecision / balanceDeployed();
+        uint256 _gaugeTokensOut = baseRewardPool.balanceOf(address(this)) * _percentWithdrawn / basisPrecision;
+        uint256 _redeemAmt = balanceLend() * _percentWithdrawn / basisPrecision;
+
+        _withdrawFromGauge(_gaugeTokensOut);
+        _exitPool(_gaugeTokensOut);
+        _swapToWMatic(stMatic.balanceOf(address(this)));
+        _repayDebt();    
+
+        // Swap Any Excess back to Want ??? 
+        if (wMatic.balanceOf(address(this)) > 0) {
+            _swapMaticToUSDC();
+        }
+
+        _redeemWant(_redeemAmt);
+
     }
+
+
+    function rebalanceCollateral() external onlyKeepers {
+        uint256 cRatio = calcCollateralRatio();
+        if (cRatio >= collatUpper) {
+            _rebalanceCollateralHigh();
+        } else {
+            _rebalanceCollateralLow();
+        }
+    }
+
+    // If Collateral Ratio goes above collat high redeem some assets from LP pool & repay debt 
+    function _rebalanceCollateralHigh() internal {
+        uint256 cRatio = calcCollateralRatio();
+        require(cRatio >= collatUpper);
+        uint256 percentAdj = (cRatio - collatTarget) * basisPrecision / cRatio;
+        uint256 _gaugeTokensOut = baseRewardPool.balanceOf(address(this)) * percentAdj / basisPrecision;
+        _withdrawFromGauge(_gaugeTokensOut);
+        _exitPool(_gaugeTokensOut);
+        _swapToWMatic(stMatic.balanceOf(address(this)));
+        _repayDebt();    
+    }
+
+    // If Collateral Ratio goes below collat low borrow some assets & deploy to LP Pool 
+    function _rebalanceCollateralLow() internal {
+
+        uint256 cRatio = calcCollateralRatio();
+        require(cRatio <= collatLower);
+
+        uint256 oPrice = getOraclePrice();
+        uint256 _amount = balanceLend();
+        uint256 _borrowAmt = (_amount * (collatTarget - cRatio) / basisPrecision) * 1e18 / oPrice;
+
+        if (_borrowAmt > maxDeploy) {
+            _borrowAmt = maxDeploy;
+        }  
+        _borrow(_borrowAmt);
+
+        (uint256 _wMaticWeight, uint256 _lpValue) = getLpData();
+        // Swap wMatic for stMatic and enter pool 
+        uint256 _swapAmt = (_borrowAmt * (basisPrecision - _wMaticWeight) / swapPercentAdj) * 1e18 / (1e18 * ( 1 + _borrowAmt / _lpValue) );
+        _swapToStMatic(_swapAmt);
+        _joinPool();
+        _depositToGauge();
+    }
+
 
     /**
      * @dev Internal function to harvest all rewards, redeploy any idle
@@ -103,14 +678,21 @@ contract Strategy is BaseStrategy {
         override
         returns (uint256 _totalAssets)
     {
-        // TODO: Implement harvesting logic and accurate accounting EX:
-        //
-        //      if(!TokenizedStrategy.isShutdown()) {
-        //          _claimAndSellRewards();
-        //      }
-        //      _totalAssets = aToken.balanceOf(address(this)) + asset.balanceOf(address(this));
-        //
-        _totalAssets = asset.balanceOf(address(this));
+        baseRewardPool.getReward(address(this), true);
+
+        // TO DO -- decide how we handle AURA Rewards? (i.e. boost or sell)
+
+
+        // Depending on current state we either swap rewards to wMatic & repay debt or accumulate more of strategies core asset
+        if (balanceDebt() > balanceLp()) {
+            _swapRewardsToWMatic();
+            _repayDebt();
+        } else {
+            _swapRewardsToAsset();
+        }
+
+        _totalAssets = asset.balanceOf(address(this)) + balanceDeployed();
+
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -138,8 +720,17 @@ contract Strategy is BaseStrategy {
      *
      * @param _totalIdle The current amount of idle funds that are available to deploy.
      *
-    function _tend(uint256 _totalIdle) internal override {}
     */
+    function _tend(uint256 _totalIdle) internal override {
+        
+        uint256 cRatio = calcCollateralRatio();
+        if (cRatio >= collatUpper) {
+            _rebalanceCollateralHigh();
+        } else {
+            _rebalanceCollateralLow();
+        }        
+    }
+
 
     /**
      * @dev Optional trigger to override if tend() will be used by the strategy.
@@ -147,8 +738,20 @@ contract Strategy is BaseStrategy {
      *
      * @return . Should return true if tend() should be called by keeper or false if not.
      *
-    function _tendTrigger() internal view override returns (bool) {}
     */
+    function _tendTrigger() internal view override returns (bool) {
+        if (balanceLend() == 0) return false;
+
+        if (calcCollateralRatio() >= collatUpper) {
+            return true;
+        } 
+        if (calcCollateralRatio() <= collatLower) {
+            return true;
+        }
+        return false;
+    }
+    
+
 
     /**
      * @notice Gets the max amount of `asset` that an address can deposit.
